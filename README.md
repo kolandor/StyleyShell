@@ -3,17 +3,6 @@
 Colour themes for **Windows PowerShell** and **CMD** in the classic console window (conhost), picked
 the way you pick them in iTerm2: browse a list, watch the window change colour, and press Enter.
 
-It uses the schemes from [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes).
-288 schemes with a free licence are bundled, and `styley update` downloads the full collection of 880+ schemes.
-
-```
-styley pick --dark          # browse dark themes; the window recolours as you move; Enter applies
-styley show nord            # preview: a mock session in the theme's colours + its 16-colour palette
-styley set "Gruvbox Dark"   # apply to PowerShell and CMD: this window, new windows, shortcuts
-styley set nord --only cmd  # a separate theme for CMD; PowerShell keeps its own
-styley restore              # undo everything
-```
-
 ## Screenshots
 
 `styley pick`: the theme list on the left; on the right, the palette and a sample session in the selected theme.
@@ -24,7 +13,7 @@ styley restore              # undo everything
 
 ![styley help: commands, palette examples and a theme preview](docs/images/styley-help.jpg)
 
-## Install
+## Install and quick start
 
 Requirements: Windows 10 1703 or later and Windows PowerShell 5.1, which ships with Windows. No admin rights are needed.
 
@@ -35,7 +24,17 @@ install.cmd
 ```
 
 This copies the tool to `%LOCALAPPDATA%\Programs\styley` and adds it to your user `PATH`. Open a new window and
-run `styley help`.
+try it:
+
+```
+styley pick --dark          # browse dark themes; the window recolours as you move; Enter applies
+styley show nord            # preview: a mock session in the theme's colours + its 16-colour palette
+styley set "Gruvbox Dark"   # apply to PowerShell and CMD: this window, new windows, shortcuts
+styley set nord --only cmd  # a separate theme for CMD; PowerShell keeps its own
+styley update               # download all 880+ schemes; 288 come bundled
+styley restore              # undo everything
+styley help                 # all commands and options
+```
 
 `install.cmd -Dev` puts the repository's `bin` folder on `PATH` instead of copying it, so your edits apply at once.
 
@@ -175,5 +174,5 @@ stack traces, and `NO_COLOR=1` for plain output.
 ## Licences
 
 styley is MIT licensed (see `LICENSE`). The bundled colour schemes belong to their authors. The collection comes from
-iTerm2-Color-Schemes (MIT, © Mark Badolato). Each bundled scheme's licence is listed in `themes/LICENSES.md`, and only
+[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes) (MIT, © Mark Badolato). Each bundled scheme's licence is listed in `themes/LICENSES.md`, and only
 schemes whose licence allows redistribution are bundled.

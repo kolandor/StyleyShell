@@ -14,6 +14,16 @@ styley set nord --only cmd  # a separate theme for CMD; PowerShell keeps its own
 styley restore              # undo everything
 ```
 
+## Screenshots
+
+`styley pick`: the theme list on the left; on the right, the palette and a sample session in the selected theme.
+
+![styley pick: interactive theme browser](docs/images/styley-pick.jpg)
+
+`styley help`: examples, palettes of popular themes and a sample session in Catppuccin Mocha.
+
+![styley help: commands, palette examples and a theme preview](docs/images/styley-help.jpg)
+
 ## Install
 
 Requirements: Windows 10 1703 or later and Windows PowerShell 5.1, which ships with Windows. No admin rights are needed.

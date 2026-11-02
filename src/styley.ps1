@@ -456,6 +456,243 @@ function Get-LivePalette {
     [pscustomobject]@{ Table = [uint32[]]$p[0..15]; Attr = [uint16]$p[16]; Popup = [uint16]$p[17] }
 }
 
+<#
+  Windows Terminal keeps its colours in its own settings, not in the console registry keys or shortcuts.
+  styley does not edit the user's settings.json. It writes a settings fragment (a JSON file Windows Terminal
+  merges into its settings) with the themes as schemes and "updates" entries that give the shell profiles
+  those schemes. The fragment is rebuilt from state.json, so restore removes what it no longer needs.
+  A colorScheme set in a profile of settings.json wins over a fragment. Windows Terminal writes one there as
+  soon as the profile's appearance is saved in its Settings UI, so styley replaces that one value in place
+  (the rest of the file stays byte for byte) and keeps the original for restore.
+#>
+$script:WtProfileGuids = @{
+    powershell = @('{61c54bbd-c2c6-5271-96e7-009a87ff44bf}', '{574e775e-4f2a-5b96-ac1e-a2962a402336}')  # Windows PowerShell, PowerShell 7
+    cmd        = @('{0caa0dad-35be-5f56-a8ff-afceeeaa6101}')                                            # Command Prompt
+}
+
+function Get-WtSettingsFiles {
+    $l = $env:LOCALAPPDATA
+    @("$l\Packages\Microsoft.WindowsTerminal_8wekyb3d8bbwe\LocalState\settings.json",
+        "$l\Packages\Microsoft.WindowsTerminalPreview_8wekyb3d8bbwe\LocalState\settings.json",
+        "$l\Microsoft\Windows Terminal\settings.json") | Where-Object { Test-Path -LiteralPath $_ }
+}
+
+function Get-WtFragmentPath { Join-Path $env:LOCALAPPDATA 'Microsoft\Windows Terminal\Fragments\styley\styley.json' }
+
+# settings.json may hold // and /* */ comments, which ConvertFrom-Json in PowerShell 5.1 rejects.
+function Read-Jsonc([string]$Path) {
+    try {
+        $s = [IO.File]::ReadAllText($Path)
+        $sb = New-Object Text.StringBuilder $s.Length
+        $i = 0; $n = $s.Length; $inStr = $false
+        while ($i -lt $n) {
+            $c = $s[$i]
+            if ($inStr) {
+                [void]$sb.Append($c)
+                if ($c -eq '\' -and $i + 1 -lt $n) { [void]$sb.Append($s[$i + 1]); $i += 2; continue }
+                if ($c -eq '"') { $inStr = $false }
+                $i++; continue
+            }
+            if ($c -eq '"') { $inStr = $true; [void]$sb.Append($c); $i++; continue }
+            if ($c -eq '/' -and $i + 1 -lt $n -and $s[$i + 1] -eq '/') {
+                while ($i -lt $n -and $s[$i] -ne "`n") { $i++ }
+                continue
+            }
+            if ($c -eq '/' -and $i + 1 -lt $n -and $s[$i + 1] -eq '*') {
+                $end = $s.IndexOf('*/', $i + 2); if ($end -lt 0) { $end = $n - 2 }
+                $i = $end + 2; continue
+            }
+            [void]$sb.Append($c); $i++
+        }
+        ($sb.ToString() -replace ',(\s*[\]}])', '$1') | ConvertFrom-Json
+    } catch { $null }
+}
+
+# Windows Terminal profiles of a shell: the inbox ones plus profiles whose commandline starts the shell.
+# Overrides: profiles whose colorScheme in settings.json takes precedence over the fragment.
+function Get-WtProfiles([string]$Shell) {
+    $guids = [ordered]@{}
+    foreach ($g in $script:WtProfileGuids[$Shell]) { $guids[$g.ToLowerInvariant()] = $g }
+    $names = @(); $overrides = @(); $explicit = @()
+    foreach ($f in Get-WtSettingsFiles) {
+        $j = Read-Jsonc $f
+        if (-not $j) { continue }
+        $profiles = Get-Prop $j 'profiles'
+        $defaults = $null; $list = $profiles
+        if ($profiles -and -not ($profiles -is [array])) { $defaults = Get-Prop $profiles 'defaults'; $list = Get-Prop $profiles 'list' }
+        if (Get-Prop $defaults 'colorScheme') { $overrides += 'profiles.defaults' }
+        foreach ($p in @($list)) {
+            $g = [string](Get-Prop $p 'guid')
+            if (-not $g) { continue }
+            $match = $guids.Contains($g.ToLowerInvariant())
+            $cl = [string](Get-Prop $p 'commandline')
+            if (-not $match -and $cl) {
+                if ($cl -match '^\s*"([^"]+)"') { $exe = $Matches[1] } else { $exe = ($cl.Trim() -split '\s+')[0] }
+                if (-not [IO.Path]::GetExtension($exe)) { $exe += '.exe' }
+                $match = (Get-ShellOfExe $exe) -eq $Shell
+            }
+            if (-not $match) { continue }
+            if (-not $guids.Contains($g.ToLowerInvariant())) { $guids[$g.ToLowerInvariant()] = $g }
+            $pn = [string](Get-Prop $p 'name'); if (-not $pn) { $pn = $g }
+            if ($names -notcontains $pn) { $names += $pn }
+            $cs = Get-Prop $p 'colorScheme'
+            if ($cs -is [string]) { $explicit += [pscustomobject]@{ File = $f; Guid = $g; Name = $pn } }
+            elseif ($cs -and $overrides -notcontains $pn) { $overrides += $pn }   # { dark, light } pair: left alone
+        }
+    }
+    [pscustomobject]@{ Guids = @($guids.Values); Names = $names; Overrides = $overrides; Explicit = $explicit }
+}
+
+# Start and end index of the innermost JSON object that contains index $At (an index outside strings).
+function Get-JsonObjectSpan([string]$s, [int]$At) {
+    $stack = New-Object 'Collections.Generic.Stack[int]'
+    $start = -1; $depth = 0; $i = 0; $n = $s.Length
+    while ($i -lt $n) {
+        if ($start -lt 0 -and $i -ge $At) {
+            if (-not $stack.Count) { return $null }
+            $start = $stack.Peek(); $depth = $stack.Count
+        }
+        $c = $s[$i]
+        if ($c -eq '"') {
+            $i++
+            while ($i -lt $n -and $s[$i] -ne '"') { if ($s[$i] -eq '\') { $i++ }; $i++ }
+            $i++; continue
+        }
+        if ($c -eq '/' -and $i + 1 -lt $n -and $s[$i + 1] -eq '/') { while ($i -lt $n -and $s[$i] -ne "`n") { $i++ }; continue }
+        if ($c -eq '/' -and $i + 1 -lt $n -and $s[$i + 1] -eq '*') {
+            $e = $s.IndexOf('*/', $i + 2); if ($e -lt 0) { return $null }
+            $i = $e + 2; continue
+        }
+        if ($c -eq '{') { $stack.Push($i) }
+        elseif ($c -eq '}') {
+            if ($start -ge 0 -and $stack.Count -eq $depth) { return @($start, $i) }
+            if ($stack.Count) { [void]$stack.Pop() }
+        }
+        $i++
+    }
+    $null
+}
+
+# The value literal of "colorScheme": "..." in the profile with this guid (a regex Group: Index, Length, Value).
+function Find-WtSchemeValue([string]$Text, [string]$Guid) {
+    $gm = [regex]::Match($Text, '"guid"\s*:\s*"' + [regex]::Escape($Guid) + '"', 'IgnoreCase')
+    if (-not $gm.Success) { return $null }
+    $span = Get-JsonObjectSpan $Text $gm.Index
+    if (-not $span) { return $null }
+    $re = [regex]'"colorScheme"\s*:\s*("(?:[^"\\]|\\.)*")'
+    $m = $re.Match($Text, $span[0], $span[1] - $span[0])
+    while ($m.Success) {
+        $own = Get-JsonObjectSpan $Text $m.Index
+        if ($own -and $own[0] -eq $span[0]) { return $m.Groups[1] }
+        $m = $m.NextMatch()
+    }
+    $null
+}
+
+function Get-WtBackupPath { Join-Path $script:DataDir 'backup\wt-colorschemes.json' }
+
+function Read-WtBackup {
+    $p = Get-WtBackupPath
+    # ConvertFrom-Json in 5.1 emits a JSON array as one object: assign first, then unroll.
+    if (Test-Path -LiteralPath $p) { try { $a = [IO.File]::ReadAllText($p) | ConvertFrom-Json; return $a } catch { } }
+}
+
+function Write-WtBackup($Entries) {
+    $p = Get-WtBackupPath
+    $Entries = @($Entries | Where-Object { $_ })
+    if (-not $Entries) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; return }
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+    [IO.File]::WriteAllText($p, (ConvertTo-Json -InputObject @($Entries) -Depth 3), (New-Object Text.UTF8Encoding($false)))
+}
+
+# Replaces the colorScheme value literal of one profile in a settings file; returns the old literal.
+function Set-WtSchemeValue([string]$File, [string]$Guid, [string]$Literal) {
+    $bytes = [IO.File]::ReadAllBytes($File)
+    $bom = $bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF
+    $skip = 0; if ($bom) { $skip = 3 }
+    $text = (New-Object Text.UTF8Encoding($false)).GetString($bytes, $skip, $bytes.Length - $skip)
+    $g = Find-WtSchemeValue $text $Guid
+    if (-not $g) { return $null }
+    if ($g.Value -ne $Literal) {
+        $text = $text.Substring(0, $g.Index) + $Literal + $text.Substring($g.Index + $g.Length)
+        [IO.File]::WriteAllText($File, $text, (New-Object Text.UTF8Encoding($bom)))
+    }
+    $g.Value
+}
+
+function ConvertTo-JsonLiteral([string]$Value) { '"' + $Value.Replace('\', '\\').Replace('"', '\"') + '"' }
+
+# Profiles that name a colorScheme in settings.json: point them at the styley scheme or, when the shell
+# has no styley theme any more, put the original value back (only if the value is still styley's).
+function Sync-WtSettingsSchemes([string]$Shell, $Profiles, [string]$Scheme) {
+    $backup = @(Read-WtBackup)
+    $changed = $false
+    if ($Scheme) {
+        foreach ($x in @($Profiles.Explicit)) {
+            try {
+                $old = Set-WtSchemeValue $x.File $x.Guid (ConvertTo-JsonLiteral $Scheme)
+                if ($null -eq $old) { continue }
+                $known = @($backup | Where-Object { $_.file -eq $x.File -and $_.guid -eq $x.Guid })
+                if (-not $known -and $old -notlike '*(styley)"') {
+                    $backup += [pscustomobject][ordered]@{ file = $x.File; guid = $x.Guid; shell = $Shell; original = $old }
+                    $changed = $true
+                }
+            } catch { Write-Warning "Windows Terminal profile '$($x.Name)' not changed: $($_.Exception.Message)" }
+        }
+    } else {
+        $keep = @()
+        foreach ($b in $backup) {
+            if ($b.shell -ne $Shell) { $keep += $b; continue }
+            $changed = $true
+            if (-not (Test-Path -LiteralPath $b.file)) { continue }
+            try {
+                $g = Find-WtSchemeValue ([IO.File]::ReadAllText($b.file)) $b.guid
+                if ($g -and $g.Value -like '*(styley)"') { [void](Set-WtSchemeValue $b.file $b.guid $b.original) }
+            } catch { Write-Warning "Windows Terminal profile $($b.guid) not restored: $($_.Exception.Message)"; $keep += $b }
+        }
+        $backup = $keep
+    }
+    if ($changed) { Write-WtBackup $backup }
+}
+
+<#
+  Rebuilds the fragment from the themes in state.json. Returns one line per shell for the report, or
+  nothing when Windows Terminal is not installed. Running windows reload their settings when settings.json
+  changes, so its write time is touched (the content stays as it is).
+#>
+function Update-WtFragment {
+    $path = Get-WtFragmentPath
+    $settings = @(Get-WtSettingsFiles)
+    if (-not $settings -and -not (Test-Path -LiteralPath $path)) { return }
+    $map = Get-ShellThemes
+    $schemes = [ordered]@{}; $profiles = @(); $lines = @()
+    foreach ($k in $script:Shells.Keys) {
+        if (-not $map.ContainsKey($k)) { Sync-WtSettingsSchemes $k $null $null; continue }
+        $name = [string](Get-Prop $map[$k] 'theme')
+        $t = Get-Themes | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+        if (-not $t) { continue }
+        $sname = "$name (styley)"
+        if (-not $schemes.Contains($sname)) { $s = ConvertTo-WtScheme $t; $s.name = $sname; $schemes[$sname] = $s }
+        $wp = Get-WtProfiles $k
+        foreach ($g in $wp.Guids) { $profiles += [pscustomobject][ordered]@{ updates = $g; colorScheme = $sname } }
+        Sync-WtSettingsSchemes $k $wp $sname
+        $who = 'profiles'; if ($wp.Names) { $who = $wp.Names -join ', ' }
+        $line = "$(Get-ShellLabel $k): $who -> '$sname'"
+        if ($wp.Overrides) { $line += " (not changed, light/dark scheme pair in settings.json: $($wp.Overrides -join ', '))" }
+        $lines += $line
+    }
+    if ($profiles) {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $path) | Out-Null
+        $doc = [ordered]@{ '$help' = 'Written by styley (styley restore removes it). Do not edit.'; profiles = $profiles; schemes = @($schemes.Values) }
+        [IO.File]::WriteAllText($path, ($doc | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding($false)))
+    } elseif (Test-Path -LiteralPath $path) {
+        Remove-Item -LiteralPath $path -Force
+        Remove-Item -LiteralPath (Split-Path -Parent $path) -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($f in $settings) { try { [IO.File]::SetLastWriteTime($f, [DateTime]::Now) } catch { } }
+    $lines
+}
+
 # Shells styley knows: key, label and the executables each one covers.
 $script:Shells = [ordered]@{
     powershell = @{ Label = 'PowerShell'; Exes = @('powershell.exe', 'pwsh.exe') }
@@ -843,8 +1080,8 @@ function Get-ModeFromFlags([string[]]$Flags) {
 
 function Test-WindowsTerminal {
     if (Test-WtSession) {
-        Out "$(Fg '#e5c07b')note:$(Rst) Windows Terminal detected. Only this tab is recoloured; new tabs use the colour scheme"
-        Out '      of the Windows Terminal profile. To make it permanent:  styley export <theme> --format wt'
+        Out "$(Fg '#e5c07b')note:$(Rst) Windows Terminal detected. --session recolours this tab only; new tabs keep the colour"
+        Out '      scheme of their Windows Terminal profile.'
         return $true
     }
     $false
@@ -859,7 +1096,7 @@ function Invoke-Set([string]$Query, [string[]]$Flags, $Theme = $null) {
     $pal = ConvertTo-ConsolePalette $Theme -KeepAnsi:$keepAnsi
     $ok = "$(Fg '#98c379')ok$(Rst)"
 
-    [void](Test-WindowsTerminal)
+    if ($sessionOnly) { [void](Test-WindowsTerminal) }
     # This window changes with --session, for both shells, or when it belongs to the target shell.
     $windowShell = Get-WindowShell
     $applyLive = $sessionOnly -or (-not $shell) -or (-not $windowShell) -or ($windowShell -eq $shell)
@@ -882,6 +1119,7 @@ function Invoke-Set([string]$Query, [string[]]$Flags, $Theme = $null) {
     $keys = @(Set-RegistryPalette $pal $shell)
     $results = @(); if ($links) { $results = @(Set-ShortcutPalette $pal $links -CreateBlock:([bool]$shell)) }
     Save-State $Theme.Name $keepAnsi $shell
+    $wt = @(); try { $wt = @(Update-WtFragment) } catch { Write-Warning "Windows Terminal not updated: $($_.Exception.Message)" }
 
     Out "$ok  $(Bold $Theme.Name)  $(Dim "-> $(Get-ShellLabel $shell)")"
     if ($live) { Out '      window     : applied' }
@@ -903,6 +1141,7 @@ function Invoke-Set([string]$Query, [string[]]$Flags, $Theme = $null) {
         Out $line
         foreach ($b in $bad) { Out (Dim "        $($b.Path): $($b.Result)") }
     }
+    foreach ($l in $wt) { Out "      terminal   : $l" }
     if ($shell) { Out (Dim "      Only $(Get-ShellLabel $shell) changed. Undo: styley restore --only $shell") }
     else { Out (Dim '      New windows open with the theme. Undo everything: styley restore') }
 }
@@ -1101,6 +1340,7 @@ function Restore-Shell([string]$Shell, [string]$Dir, $Manifest) {
     $map = Get-ShellThemes
     [void]$map.Remove($Shell)
     Save-ShellThemes $map
+    try { [void](Update-WtFragment) } catch { Write-Warning "Windows Terminal not updated: $($_.Exception.Message)" }
     Out "Restored $(Get-ShellLabel $Shell) from the backup of $($Manifest.created): $keysDone key(s), $n shortcut(s)."
     Out (Dim "Open a new $(Get-ShellLabel $Shell) window to see the original colours.")
 }
@@ -1143,6 +1383,7 @@ function Invoke-Restore([string[]]$Flags = @()) {
         catch { Write-Warning "Shortcut not restored: $($s.original): $($_.Exception.Message)" }
     }
     Save-ShellThemes @{}
+    try { [void](Update-WtFragment) } catch { Write-Warning "Windows Terminal not updated: $($_.Exception.Message)" }
     Out "Restored console settings from $($m.created): registry + $n shortcut(s)."
     Out (Dim 'Open a new window to see the original colours.')
 }
@@ -1330,7 +1571,7 @@ function Show-Help {
     Out "    styley set nord --only cmd         $(Dim '# CMD gets Nord, PowerShell keeps its theme')"
     Out "    styley pick --powershell           $(Dim '# choose a theme for PowerShell only')"
     Out "    styley random --light              $(Dim '# feeling lucky')"
-    Out "    styley export nord --format wt     $(Dim '# for Windows Terminal settings.json')"
+    Out "    styley export nord --format wt     $(Dim '# print as a Windows Terminal scheme (set/pick apply it there already)')"
     Out "    styley update                      $(Dim '# all 880+ schemes, incl. ones not bundled (e.g. Dracula)')"
     Out "    styley import C:\src\iTerm2-Color-Schemes"
     Out "    styley restore --only cmd          $(Dim '# undo CMD only')"

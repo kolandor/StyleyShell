@@ -24,10 +24,34 @@ install.cmd
 ```
 
 This copies the tool to `%LOCALAPPDATA%\Programs\styley` and adds it to your user `PATH`. Open a new window and
-try it:
+pick a theme.
+
+### Pick a theme
+
+The window recolours as you move through the list. Type to filter, Tab switches between all, dark and light themes,
+Enter applies, Esc cancels and brings the old colours back.
+
+One theme for both PowerShell and CMD:
 
 ```
-styley pick --dark          # browse dark themes; the window recolours as you move; Enter applies
+styley pick
+```
+
+A theme for PowerShell only; CMD keeps its own:
+
+```
+styley pick --only powershell
+```
+
+A theme for CMD only; PowerShell keeps its own:
+
+```
+styley pick --only cmd
+```
+
+### Other commands
+
+```
 styley show nord            # preview: a mock session in the theme's colours + its 16-colour palette
 styley set "Gruvbox Dark"   # apply to PowerShell and CMD: this window, new windows, shortcuts
 styley set nord --only cmd  # a separate theme for CMD; PowerShell keeps its own

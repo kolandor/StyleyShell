@@ -409,10 +409,38 @@ function ConvertTo-ConsolePalette($Theme, [switch]$KeepAnsi) {
         $table[0] = ConvertTo-ColorRef $Theme.Background
         $table[7] = ConvertTo-ColorRef $Theme.Foreground
     }
-    [pscustomobject]@{ Table = $table; Attr = [uint16]0x07; Popup = [uint16]0xF5 }
+    # Ansi/Background/Foreground/Cursor: the theme's own colours, used for Windows Terminal (see Set-TerminalPalette).
+    [pscustomobject]@{
+        Table = $table; Attr = [uint16]0x07; Popup = [uint16]0xF5
+        Ansi = @($Theme.Ansi); Background = $Theme.Background; Foreground = $Theme.Foreground; Cursor = $Theme.Cursor
+    }
+}
+
+function Test-WtSession { [bool]$env:WT_SESSION }
+
+<#
+  Windows Terminal ignores the console palette API, but it understands the xterm colour sequences:
+  OSC 4 (16 ANSI colours), OSC 10/11/12 (foreground, background, cursor). They recolour the current tab only.
+  A palette without theme colours (one read back from the console) resets the tab to its profile's scheme.
+#>
+function Set-TerminalPalette($Palette) {
+    if (-not $script:Color) { return }  # VT processing is off: the sequences would be printed as text
+    $E = $script:E; $bel = [char]7
+    $rgb = { param($Hex) $c = ConvertFrom-Hex $Hex; 'rgb:{0:x2}/{1:x2}/{2:x2}' -f $c[0], $c[1], $c[2] }
+    $sb = New-Object Text.StringBuilder
+    if ($Palette.PSObject.Properties['Background'] -and $Palette.Background -and @($Palette.Ansi).Count -eq 16) {
+        for ($i = 0; $i -lt 16; $i++) { [void]$sb.Append("$E]4;$i;$(& $rgb $Palette.Ansi[$i])$bel") }
+        [void]$sb.Append("$E]10;$(& $rgb $Palette.Foreground)$bel$E]11;$(& $rgb $Palette.Background)$bel")
+        if ($Palette.Cursor) { [void]$sb.Append("$E]12;$(& $rgb $Palette.Cursor)$bel") }
+    } else {
+        [void]$sb.Append("$E]104$bel$E]110$bel$E]111$bel$E]112$bel")
+    }
+    [Console]::Out.Write($sb.ToString())
+    [Console]::Out.Flush()
 }
 
 function Set-LivePalette($Palette, [switch]$Remap) {
+    if (Test-WtSession) { Set-TerminalPalette $Palette }
     Initialize-Native
     [Styley.Console]::SetPalette($Palette.Table, $Palette.Attr, $Palette.Popup, [bool]$Remap)
 }
@@ -810,8 +838,8 @@ function Get-ModeFromFlags([string[]]$Flags) {
 
 function Test-WindowsTerminal {
     if ($env:WT_SESSION) {
-        Out "$(Fg '#e5c07b')note:$(Rst) Windows Terminal detected. It ignores console palettes: the theme is saved for"
-        Out '      classic console windows. For Windows Terminal use:  styley export <theme> --format wt'
+        Out "$(Fg '#e5c07b')note:$(Rst) Windows Terminal detected. Only this tab is recoloured; new tabs use the colour scheme"
+        Out '      of the Windows Terminal profile. To make it permanent:  styley export <theme> --format wt'
         return $true
     }
     $false

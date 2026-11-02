@@ -172,8 +172,10 @@ theme **background into slot 0 (black)** and the **foreground into slot 7 (white
 
 ### Windows Terminal
 
-Windows Terminal ignores console palettes. Use `styley export <theme> --format wt` and paste the output into the
-`schemes` list of its `settings.json`.
+Windows Terminal, the default terminal on Windows 11, ignores console palettes. Inside it, `styley pick` and
+`styley set` recolour the current tab with xterm colour sequences (OSC 4/10/11/12), and Esc in the picker
+resets the tab to its profile's scheme. New tabs still use the profile's scheme. To keep a theme, use
+`styley export <theme> --format wt` and paste the output into the `schemes` list of its `settings.json`.
 
 ## Development
 

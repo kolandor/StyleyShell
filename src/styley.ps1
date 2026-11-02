@@ -416,7 +416,12 @@ function ConvertTo-ConsolePalette($Theme, [switch]$KeepAnsi) {
     }
 }
 
-function Test-WtSession { [bool]$env:WT_SESSION }
+# Windows Terminal (or another ConPTY host). WT_SESSION alone misses windows that conhost handed over
+# to Windows Terminal as the default terminal, such as ones started from the Start menu shortcut.
+function Test-WtSession {
+    if ($env:WT_SESSION) { return $true }
+    try { Initialize-Native; return [Styley.Console]::IsPseudoConsole() } catch { return $false }
+}
 
 <#
   Windows Terminal ignores the console palette API, but it understands the xterm colour sequences:
@@ -837,7 +842,7 @@ function Get-ModeFromFlags([string[]]$Flags) {
 }
 
 function Test-WindowsTerminal {
-    if ($env:WT_SESSION) {
+    if (Test-WtSession) {
         Out "$(Fg '#e5c07b')note:$(Rst) Windows Terminal detected. Only this tab is recoloured; new tabs use the colour scheme"
         Out '      of the Windows Terminal profile. To make it permanent:  styley export <theme> --format wt'
         return $true

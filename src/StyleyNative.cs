@@ -132,6 +132,22 @@ namespace Styley
             }
         }
 
+        [DllImport("kernel32.dll")] static extern IntPtr GetConsoleWindow();
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr hWnd, System.Text.StringBuilder name, int max);
+
+        /// <summary>
+        /// True when this console is a pseudoconsole (ConPTY): Windows Terminal, VS Code and others.
+        /// Such hosts ignore the console palette API. Unlike WT_SESSION this also covers windows that
+        /// conhost handed over to Windows Terminal (default terminal), e.g. started from a .lnk shortcut.
+        /// </summary>
+        public static bool IsPseudoConsole()
+        {
+            IntPtr w = GetConsoleWindow();
+            if (w == IntPtr.Zero) return false;
+            var sb = new System.Text.StringBuilder(64);
+            return GetClassNameW(w, sb, sb.Capacity) > 0 && sb.ToString() == "PseudoConsoleWindow";
+        }
+
         [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetConsoleProcessList([Out] uint[] list, uint count);
 
         /// <summary>Process ids attached to this console window (empty when unknown).</summary>

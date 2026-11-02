@@ -11,7 +11,7 @@
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$script:Version = '0.1.0'
+$script:Version = '0.2.0'
 $script:Root = Split-Path -Parent $PSScriptRoot          # repo or install root
 $script:DataDir = Join-Path $env:LOCALAPPDATA 'styley'   # user data: imported themes, backups, state
 $script:E = [char]27
@@ -423,22 +423,123 @@ function Get-LivePalette {
     [pscustomobject]@{ Table = [uint32[]]$p[0..15]; Attr = [uint16]$p[16]; Popup = [uint16]$p[17] }
 }
 
-function Get-ShellConsoleKeys {
-    Get-ChildItem -LiteralPath 'HKCU:\Console' -ErrorAction SilentlyContinue |
-        Where-Object { $n = $_.PSChildName.ToLowerInvariant(); @($script:ShellExes | Where-Object { $n.EndsWith('_' + $_) }).Count -gt 0 }
+# Shells styley knows: key, label and the executables each one covers.
+$script:Shells = [ordered]@{
+    powershell = @{ Label = 'PowerShell'; Exes = @('powershell.exe', 'pwsh.exe') }
+    cmd        = @{ Label = 'CMD'; Exes = @('cmd.exe') }
 }
 
-function Set-RegistryPalette($Palette) {
-    $keys = @('HKCU:\Console') + @(Get-ShellConsoleKeys | ForEach-Object { $_.PSPath })
-    if (-not (Test-Path -LiteralPath 'HKCU:\Console')) { New-Item -Path 'HKCU:\Console' | Out-Null }
-    foreach ($k in $keys) {
-        for ($i = 0; $i -lt 16; $i++) {
-            New-ItemProperty -LiteralPath $k -Name ('ColorTable{0:D2}' -f $i) -PropertyType DWord -Value ([int]$Palette.Table[$i]) -Force | Out-Null
-        }
-        New-ItemProperty -LiteralPath $k -Name 'ScreenColors' -PropertyType DWord -Value ([int]$Palette.Attr) -Force | Out-Null
-        New-ItemProperty -LiteralPath $k -Name 'PopupColors' -PropertyType DWord -Value ([int]$Palette.Popup) -Force | Out-Null
+function Get-ShellOfExe([string]$Exe) {
+    if (-not $Exe) { return $null }
+    $leaf = [IO.Path]::GetFileName($Exe).ToLowerInvariant()
+    foreach ($k in $script:Shells.Keys) { if ($script:Shells[$k].Exes -contains $leaf) { return $k } }
+    $null
+}
+
+function Get-ShellLabel([string]$Shell) {
+    if ($Shell -and $script:Shells.Contains($Shell)) { return $script:Shells[$Shell].Label }
+    if ($Shell) { return $Shell }
+    'PowerShell + CMD'
+}
+
+# --only <shell> | --powershell | --cmd  ->  'powershell' | 'cmd' | $null (both shells)
+function Get-TargetShell([string[]]$Flags) {
+    $v = Get-FlagValue $Flags '--only'
+    if (-not $v) {
+        if (Test-Flag $Flags '--cmd', '-cmd') { $v = 'cmd' }
+        elseif (Test-Flag $Flags '--powershell', '-powershell', '--ps', '--pwsh') { $v = 'powershell' }
     }
-    $keys.Count
+    if (-not $v) { return $null }
+    switch -Regex ($v.ToLowerInvariant()) {
+        '^(powershell|ps|pwsh|posh)$' { return 'powershell' }
+        '^(cmd|command|cmd\.exe)$' { return 'cmd' }
+        '^(all|both)$' { return $null }
+    }
+    throw (New-StyleyError "Unknown shell '$v'. Use: --only powershell  or  --only cmd")
+}
+
+# Shell that owns this console window: the earliest process attached to it.
+function Get-WindowShell {
+    try {
+        Initialize-Native
+        $procs = foreach ($id in [Styley.Console]::GetProcesses()) {
+            if ($id -eq $PID) { continue }
+            try { Get-Process -Id $id -ErrorAction Stop } catch { }
+        }
+        $first = $procs | Where-Object { try { $null = $_.StartTime; $true } catch { $false } } |
+            Sort-Object StartTime | Select-Object -First 1
+        if ($first) { return (Get-ShellOfExe ($first.ProcessName + '.exe')) }
+    } catch { }
+    $null
+}
+
+# Registry key name conhost uses for a program: %SystemRoot% folded, '\' -> '_'.
+function ConvertTo-ConsoleKeyName([string]$ExePath) {
+    $p = $ExePath
+    $root = $env:SystemRoot.TrimEnd('\')
+    if ($p.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)) { $p = '%SystemRoot%' + $p.Substring($root.Length) }
+    $p.Replace('\', '_')
+}
+
+# Registry access goes through .NET: key names such as "C:_Program Files_PowerShell_7_pwsh.exe"
+# confuse the PowerShell registry provider.
+function Get-ConsoleSubKeyNames {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Console')
+    if (-not $k) { return }
+    try { $k.GetSubKeyNames() } finally { $k.Close() }
+}
+
+function Get-ConsoleValues([string]$SubKey) {
+    $h = @{}
+    $k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey)
+    if ($k) { try { foreach ($n in $k.GetValueNames()) { $h[$n] = $k.GetValue($n) } } finally { $k.Close() } }
+    $h
+}
+
+# Existing HKCU\Console subkeys (names) of one shell, or of all shells.
+function Get-ShellConsoleKeys([string]$Shell = $null) {
+    foreach ($n in Get-ConsoleSubKeyNames) {
+        $sh = Get-ShellOfExe ($n -replace '^.*_', '')
+        if ($sh -and (-not $Shell -or $sh -eq $Shell)) { $n }
+    }
+}
+
+# Keys (relative to HKCU) a shell starts with: the standard ones, created when missing, plus existing ones.
+function Get-ShellKeyPaths([string]$Shell) {
+    $names = @()
+    if ($Shell -eq 'powershell') {
+        $names += '%SystemRoot%_System32_WindowsPowerShell_v1.0_powershell.exe', '%SystemRoot%_SysWOW64_WindowsPowerShell_v1.0_powershell.exe'
+        $pwsh = Get-Command pwsh.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($pwsh) { $names += ConvertTo-ConsoleKeyName $pwsh.Source }
+    } elseif ($Shell -eq 'cmd') {
+        $names += '%SystemRoot%_system32_cmd.exe', '%SystemRoot%_SysWOW64_cmd.exe'
+    }
+    $names += @(Get-ShellConsoleKeys $Shell)
+    $seen = @{}
+    foreach ($n in $names) {
+        if (-not $seen.ContainsKey($n.ToLowerInvariant())) { $seen[$n.ToLowerInvariant()] = 1; "Console\$n" }
+    }
+}
+
+function Write-ConsoleColors([string]$SubKey, $Palette) {
+    $k = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKey)
+    try {
+        for ($i = 0; $i -lt 16; $i++) { $k.SetValue(('ColorTable{0:D2}' -f $i), [int]$Palette.Table[$i], [Microsoft.Win32.RegistryValueKind]::DWord) }
+        $k.SetValue('ScreenColors', [int]$Palette.Attr, [Microsoft.Win32.RegistryValueKind]::DWord)
+        $k.SetValue('PopupColors', [int]$Palette.Popup, [Microsoft.Win32.RegistryValueKind]::DWord)
+    } finally { $k.Close() }
+}
+
+<#
+  Both shells ($Shell empty): HKCU\Console (shared defaults) + every existing shell key.
+  One shell: only that shell's keys, created when missing; the shared defaults stay as they are.
+  Returns the keys written.
+#>
+function Set-RegistryPalette($Palette, [string]$Shell = $null) {
+    if ($Shell) { $keys = @(Get-ShellKeyPaths $Shell) }
+    else { $keys = @('Console') + @(Get-ShellConsoleKeys | ForEach-Object { "Console\$_" }) }
+    foreach ($k in $keys) { Write-ConsoleColors $k $Palette }
+    $keys
 }
 
 function Get-ShortcutRoots {
@@ -452,35 +553,81 @@ function Get-ShortcutRoots {
     $roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
 }
 
-# Shortcuts that start powershell.exe / pwsh.exe / cmd.exe. WinX menu links are hashed and left alone.
-function Get-ConsoleShortcuts {
-    $shell = New-Object -ComObject WScript.Shell
+# Shortcuts that start powershell.exe / pwsh.exe / cmd.exe: objects { Path, Shell }.
+# WinX menu links are hashed and left alone.
+function Get-ConsoleShortcuts([string]$Shell = $null) {
+    $ws = New-Object -ComObject WScript.Shell
     try {
         foreach ($root in Get-ShortcutRoots) {
             foreach ($f in Get-ChildItem -LiteralPath $root -Filter '*.lnk' -Recurse -File -ErrorAction SilentlyContinue) {
-                try { $target = $shell.CreateShortcut($f.FullName).TargetPath } catch { continue }
-                if (-not $target) { continue }
-                $leaf = [IO.Path]::GetFileName($target).ToLowerInvariant()
-                if ($script:ShellExes -contains $leaf) { $f.FullName }
+                try { $target = $ws.CreateShortcut($f.FullName).TargetPath } catch { continue }
+                $sh = Get-ShellOfExe $target
+                if ($sh -and (-not $Shell -or $sh -eq $Shell)) { [pscustomobject]@{ Path = $f.FullName; Shell = $sh } }
             }
         }
-    } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell) }
+    } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
 }
 
 function Test-Writable([string]$Path) {
     try { [IO.File]::Open($Path, 'Open', 'ReadWrite', 'ReadWrite').Dispose(); $true } catch { $false }
 }
 
-function Set-ShortcutPalette($Palette, [string[]]$Paths) {
+<#
+  NT_CONSOLE_PROPS block (204 bytes) for a shortcut that has none: window, font and editing
+  settings from the registry ($SubKey over HKCU\Console), colours from the palette.
+#>
+function New-ConsoleBlock($Palette, [string]$SubKey = $null) {
+    $v = Get-ConsoleValues 'Console'
+    if ($SubKey) { $o = Get-ConsoleValues $SubKey; foreach ($n in $o.Keys) { $v[$n] = $o[$n] } }
+    $b = New-Object byte[] 204
+    $int = { param([int]$Off, $Val) [BitConverter]::GetBytes([int]$Val).CopyTo($b, $Off) }
+    $reg = { param([string]$Name, [int]$Default) if ($v.ContainsKey($Name) -and $v[$Name] -is [int]) { $v[$Name] } else { $Default } }
+    & $int 0 204
+    [BitConverter]::GetBytes([uint32]2684354562).CopyTo($b, 4)                 # 0xA0000002 NT_CONSOLE_PROPS_SIG
+    [BitConverter]::GetBytes([uint16]$Palette.Attr).CopyTo($b, 8)
+    [BitConverter]::GetBytes([uint16]$Palette.Popup).CopyTo($b, 10)
+    & $int 12 (& $reg 'ScreenBufferSize' 0x23290078)                           # 120 x 9001
+    & $int 16 (& $reg 'WindowSize' 0x001E0078)                                 # 120 x 30
+    $hasPos = $v.ContainsKey('WindowPosition')
+    & $int 20 (& $reg 'WindowPosition' 0)
+    & $int 32 (& $reg 'FontSize' 0x00100000)
+    & $int 36 (& $reg 'FontFamily' 0x36)
+    & $int 40 (& $reg 'FontWeight' 400)
+    $face = 'Consolas'; if ($v.ContainsKey('FaceName') -and $v['FaceName']) { $face = [string]$v['FaceName'] }
+    if ($face.Length -gt 31) { $face = $face.Substring(0, 31) }
+    [Text.Encoding]::Unicode.GetBytes($face).CopyTo($b, 44)
+    & $int 108 (& $reg 'CursorSize' 25)
+    & $int 112 (& $reg 'FullScreen' 0)
+    & $int 116 (& $reg 'QuickEdit' 1)
+    & $int 120 (& $reg 'InsertMode' 1)
+    & $int 124 ([int](-not $hasPos))
+    & $int 128 (& $reg 'HistoryBufferSize' 50)
+    & $int 132 (& $reg 'NumberOfHistoryBuffers' 4)
+    & $int 136 (& $reg 'HistoryNoDup' 0)
+    for ($i = 0; $i -lt 16; $i++) { [BitConverter]::GetBytes([uint32]$Palette.Table[$i]).CopyTo($b, 140 + 4 * $i) }
+    , $b
+}
+
+<#
+  Writes the palette into shortcuts ($Links: objects { Path, Shell }).
+  -CreateBlock (theme for one shell): a shortcut without its own colours takes them from HKCU\Console,
+  not from the shell's key, so it gets a console block of its own.
+#>
+function Set-ShortcutPalette($Palette, $Links, [switch]$CreateBlock) {
     Initialize-Native
-    foreach ($p in $Paths) {
-        $r = $null
+    foreach ($l in $Links) {
+        $p = $l.Path; $r = $null
         if (-not (Test-Writable $p)) { $r = 'no-access' }   # e.g. ProgramData shortcuts without admin rights
         if (-not $r) {
-            try { $r = [Styley.Shortcut]::SetPalette($p, $Palette.Table, $Palette.Attr, $Palette.Popup) }
-            catch { $r = 'error: ' + $_.Exception.GetBaseException().Message }
+            try {
+                $r = [Styley.Shortcut]::SetPalette($p, $Palette.Table, $Palette.Attr, $Palette.Popup)
+                if ($r -eq 'no-console-block' -and $CreateBlock) {
+                    $sub = @(Get-ShellKeyPaths $l.Shell)[0]
+                    $r = [Styley.Shortcut]::SetConsoleBlock($p, (New-ConsoleBlock $Palette $sub))
+                }
+            } catch { $r = 'error: ' + $_.Exception.GetBaseException().Message }
         }
-        [pscustomobject]@{ Path = $p; Result = $r }
+        [pscustomobject]@{ Path = $p; Shell = $l.Shell; Result = $r }
     }
 }
 
@@ -497,7 +644,7 @@ function Invoke-Reg([string]$Arguments) {
 }
 
 # Taken once, before styley changes anything for the first time.
-function Save-OriginalBackup([string[]]$Shortcuts) {
+function Save-OriginalBackup($Shortcuts) {
     $dir = Get-BackupDir
     if (Test-Path -LiteralPath (Join-Path $dir 'manifest.json')) { return $false }
     New-Item -ItemType Directory -Force -Path (Join-Path $dir 'lnk') | Out-Null
@@ -505,11 +652,11 @@ function Save-OriginalBackup([string[]]$Shortcuts) {
     Invoke-Reg "export ""HKCU\Console"" ""$reg"" /y"
     $i = 0
     # Only shortcuts styley can change; the rest (e.g. ProgramData without admin) are never touched.
-    $links = foreach ($s in ($Shortcuts | Where-Object { Test-Writable $_ })) {
+    $links = foreach ($s in ($Shortcuts | Where-Object { Test-Writable $_.Path })) {
         $i++
         $copy = Join-Path $dir ('lnk\{0:D3}.lnk' -f $i)
-        Copy-Item -LiteralPath $s -Destination $copy -Force
-        [ordered]@{ original = $s; copy = (Split-Path -Leaf $copy) }
+        Copy-Item -LiteralPath $s.Path -Destination $copy -Force
+        [ordered]@{ original = $s.Path; shell = $s.Shell; copy = (Split-Path -Leaf $copy) }
     }
     $manifest = [ordered]@{ created = (Get-Date).ToString('s'); registry = 'console.reg'; shortcuts = @($links) }
     [IO.File]::WriteAllText((Join-Path $dir 'manifest.json'), ($manifest | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
@@ -522,10 +669,39 @@ function Get-State {
     $null
 }
 
-function Save-State([string]$Theme, [bool]$KeepAnsi) {
+# state.json: { "shells": { "powershell": { theme, keepAnsi, applied }, "cmd": { ... } } }
+# Returns @{ <shell> = entry } for shells that have a theme set by styley.
+function Get-ShellThemes {
+    $r = @{}
+    $s = Get-State
+    if (-not $s) { return $r }
+    $shells = Get-Prop $s 'shells'
+    if ($shells) {
+        foreach ($k in $script:Shells.Keys) { $e = Get-Prop $shells $k; if ($e -and (Get-Prop $e 'theme')) { $r[$k] = $e } }
+    } elseif (Get-Prop $s 'theme') {
+        foreach ($k in $script:Shells.Keys) { $r[$k] = $s }   # 0.1.0 format: one theme for both shells
+    }
+    $r
+}
+
+function Save-ShellThemes([hashtable]$Map) {
+    $p = Join-Path $script:DataDir 'state.json'
+    if (-not $Map.Count) { Remove-Item -LiteralPath $p -Force -ErrorAction SilentlyContinue; return }
     New-Item -ItemType Directory -Force -Path $script:DataDir | Out-Null
-    $s = [ordered]@{ theme = $Theme; keepAnsi = $KeepAnsi; applied = (Get-Date).ToString('s') }
-    [IO.File]::WriteAllText((Join-Path $script:DataDir 'state.json'), ($s | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    $o = [ordered]@{}
+    foreach ($k in $script:Shells.Keys) {
+        if (-not $Map.ContainsKey($k)) { continue }
+        $e = $Map[$k]
+        $o[$k] = [ordered]@{ theme = [string](Get-Prop $e 'theme'); keepAnsi = [bool](Get-Prop $e 'keepAnsi'); applied = [string](Get-Prop $e 'applied') }
+    }
+    [IO.File]::WriteAllText($p, ([ordered]@{ shells = $o } | ConvertTo-Json -Depth 4), (New-Object Text.UTF8Encoding($false)))
+}
+
+function Save-State([string]$Theme, [bool]$KeepAnsi, [string]$Shell = $null) {
+    $map = Get-ShellThemes
+    $entry = [pscustomobject]@{ theme = $Theme; keepAnsi = $KeepAnsi; applied = (Get-Date).ToString('s') }
+    foreach ($k in $script:Shells.Keys) { if (-not $Shell -or $k -eq $Shell) { $map[$k] = $entry } }
+    Save-ShellThemes $map
 }
 
 # --------------------------------------------------------------------------------------------
@@ -646,70 +822,92 @@ function Invoke-Set([string]$Query, [string[]]$Flags, $Theme = $null) {
     $keepAnsi = Test-Flag $Flags '--keep-ansi', '-keep-ansi'
     $sessionOnly = Test-Flag $Flags '--session', '-session', '-s'
     $noLinks = Test-Flag $Flags '--no-shortcuts', '-no-shortcuts'
+    $shell = Get-TargetShell $Flags
     $pal = ConvertTo-ConsolePalette $Theme -KeepAnsi:$keepAnsi
     $ok = "$(Fg '#98c379')ok$(Rst)"
 
     [void](Test-WindowsTerminal)
+    # This window changes with --session, for both shells, or when it belongs to the target shell.
+    $windowShell = Get-WindowShell
+    $applyLive = $sessionOnly -or (-not $shell) -or (-not $windowShell) -or ($windowShell -eq $shell)
     $live = $false
-    try { Set-LivePalette $pal -Remap; $live = $true } catch { Write-Warning "Current window not changed: $($_.Exception.Message)" }
+    if ($applyLive) {
+        try { Set-LivePalette $pal -Remap; $live = $true } catch { Write-Warning "Current window not changed: $($_.Exception.Message)" }
+    }
 
     if ($sessionOnly) {
         Out "$ok  '$($Theme.Name)' applied to this window only (--session)."
         return
     }
 
-    $links = @(); if (-not $noLinks) { $links = @(Get-ConsoleShortcuts) }
-    if (Save-OriginalBackup -Shortcuts $links) {
+    # The backup covers every shell shortcut, so a later restore works for either shell.
+    $allLinks = @(); if (-not $noLinks) { $allLinks = @(Get-ConsoleShortcuts) }
+    if (Save-OriginalBackup -Shortcuts $allLinks) {
         Out (Dim "      Original console settings saved to $(Get-BackupDir)  (undo: styley restore)")
     }
-    $n = Set-RegistryPalette $pal
-    $results = @(); if ($links) { $results = @(Set-ShortcutPalette $pal $links) }
-    Save-State $Theme.Name $keepAnsi
+    $links = @($allLinks | Where-Object { -not $shell -or $_.Shell -eq $shell })
+    $keys = @(Set-RegistryPalette $pal $shell)
+    $results = @(); if ($links) { $results = @(Set-ShortcutPalette $pal $links -CreateBlock:([bool]$shell)) }
+    Save-State $Theme.Name $keepAnsi $shell
 
-    Out "$ok  $(Bold $Theme.Name)"
+    Out "$ok  $(Bold $Theme.Name)  $(Dim "-> $(Get-ShellLabel $shell)")"
     if ($live) { Out '      window     : applied' }
-    Out "      registry   : HKCU\Console + $($n - 1) shell key(s)"
+    elseif (-not $applyLive) { Out "      window     : unchanged (this is a $(Get-ShellLabel $windowShell) window; open a new $(Get-ShellLabel $shell) window)" }
+    if ($shell) { Out "      registry   : $($keys.Count) $(Get-ShellLabel $shell) key(s)" }
+    else { Out "      registry   : HKCU\Console + $($keys.Count - 1) shell key(s)" }
     $upd = @($results | Where-Object Result -eq 'updated')
+    $new = @($results | Where-Object Result -eq 'created')
     $own = @($results | Where-Object Result -eq 'no-console-block')
     $deny = @($results | Where-Object Result -eq 'no-access')
-    $bad = @($results | Where-Object { $_.Result -notin 'updated', 'no-console-block', 'no-access' })
+    $bad = @($results | Where-Object { $_.Result -notin 'updated', 'created', 'no-console-block', 'no-access' })
     if ($noLinks) { Out '      shortcuts  : skipped (--no-shortcuts)' }
     else {
-        $line = "      shortcuts  : $($upd.Count) updated, $($own.Count) use registry"
+        $line = "      shortcuts  : $($upd.Count) updated"
+        if ($new) { $line += ", $($new.Count) given own colours" }
+        if ($own) { $line += ", $($own.Count) use registry" }
         if ($deny) { $line += ", $($deny.Count) need admin (skipped)" }
         if ($bad) { $line += ", $($bad.Count) failed" }
         Out $line
         foreach ($b in $bad) { Out (Dim "        $($b.Path): $($b.Result)") }
     }
-    Out (Dim '      New windows open with the theme. Undo everything: styley restore')
+    if ($shell) { Out (Dim "      Only $(Get-ShellLabel $shell) changed. Undo: styley restore --only $shell") }
+    else { Out (Dim '      New windows open with the theme. Undo everything: styley restore') }
 }
 
 function Invoke-List([string]$Filter, [string[]]$Flags) {
     $mode = Get-ModeFromFlags $Flags
     $themes = Select-Themes $Filter $mode
-    $state = Get-State
-    $current = ''; if ($state) { $current = [string]$state.theme }
+    $map = Get-ShellThemes
+    $ps = ''; $cm = ''
+    if ($map.ContainsKey('powershell')) { $ps = [string]$map['powershell'].theme }
+    if ($map.ContainsKey('cmd')) { $cm = [string]$map['cmd'].theme }
     foreach ($t in $themes) {
-        $mark = ' '; if ($t.Name -eq $current) { $mark = '*' }
+        $mark = ' '
+        if ($t.Name -eq $ps -and $t.Name -eq $cm) { $mark = '*' }
+        elseif ($t.Name -eq $ps) { $mark = 'P' }
+        elseif ($t.Name -eq $cm) { $mark = 'C' }
         Out (Format-ThemeLine $t -Mark $mark)
     }
     $all = (Get-Themes).Count
+    if ($ps -or $cm) { Out (Dim "* PowerShell + CMD   P PowerShell   C CMD") }
     Out (Dim "$($themes.Count) of $all themes. Preview: styley show <name>   Apply: styley set <name>   Browse: styley pick")
 }
 
 function Invoke-Current {
-    $state = Get-State
-    if ($state -and $state.theme) {
-        Out "Current theme: $(Bold $state.theme)  $(Dim "(set $($state.applied))")"
-    } else {
-        Out 'No theme set by styley yet.'
+    $map = Get-ShellThemes
+    foreach ($k in $script:Shells.Keys) {
+        $label = (Get-ShellLabel $k).PadRight(11)
+        if ($map.ContainsKey($k)) { Out "${label}: $(Bold $map[$k].theme)  $(Dim "(set $($map[$k].applied))")" }
+        else { Out "${label}: $(Dim 'not set by styley')" }
     }
     try {
         $live = Get-LivePalette
         $ansi = foreach ($ai in 0..15) { ConvertFrom-ColorRef $live.Table[$script:ConsoleFromAnsi[$ai]] }
         $fake = [pscustomobject]@{ Ansi = $ansi }
-        if ($script:Color) { Out "This window: $(Format-Swatch $fake 2)  $(Dim ('attr 0x{0:X2}' -f $live.Attr))" }
-        else { Out ("This window: {0}  attr 0x{1:X2}" -f ($ansi -join ' '), $live.Attr) }
+        $ws = Get-WindowShell
+        $label = 'This window'; if ($ws) { $label += " ($(Get-ShellLabel $ws))" }
+        if ($script:Color) { Out "${label}: $(Format-Swatch $fake 2)  $(Dim ('attr 0x{0:X2}' -f $live.Attr))" }
+        else { Out ("{0}: {1}  attr 0x{2:X2}" -f $label, ($ansi -join ' '), $live.Attr) }
     } catch { }
 }
 
@@ -778,16 +976,126 @@ function Invoke-Update([string[]]$Flags) {
     }
 }
 
-function Invoke-Restore {
+# reg export file -> @{ '<subkey lowercase>' = @{ Name = 'Console\...'; Values = @{ ColorTable00 = ...; ... } } }
+function Read-RegColors([string]$Path) {
+    $r = @{}; $cur = $null
+    foreach ($l in [IO.File]::ReadAllLines($Path)) {
+        if ($l -match '^\[HKEY_CURRENT_USER\\(.+)\]$') {
+            $cur = $Matches[1]; $r[$cur.ToLowerInvariant()] = @{ Name = $cur; Values = @{} }; continue
+        }
+        if ($cur -and $l -match '^"(ColorTable\d\d|ScreenColors|PopupColors)"=dword:([0-9a-fA-F]{8})$') {
+            $r[$cur.ToLowerInvariant()].Values[$Matches[1]] = [Convert]::ToInt32($Matches[2], 16)
+        }
+    }
+    $r
+}
+
+function Get-PaletteFromValues([hashtable]$Values, [hashtable]$Fallback) {
+    $t = New-Object 'uint32[]' 16
+    $pick = { param($n, $d) if ($Values.ContainsKey($n)) { [int]$Values[$n] } elseif ($Fallback.ContainsKey($n) -and $Fallback[$n] -is [int]) { [int]$Fallback[$n] } else { $d } }
+    for ($i = 0; $i -lt 16; $i++) { $t[$i] = [uint32](& $pick ('ColorTable{0:D2}' -f $i) 0) }
+    [pscustomobject]@{ Table = $t; Attr = [uint16](& $pick 'ScreenColors' 7); Popup = [uint16](& $pick 'PopupColors' 0xF5) }
+}
+
+<#
+  Restores one shell. Its registry keys and shortcuts get their original values back. When the shared
+  defaults (HKCU\Console) are no longer the original ones, because a theme was set for both shells, the original
+  defaults are written into the shell's own keys, and shortcuts without their own colours get a console
+  block, so the shell looks as it did before and the other shell keeps its theme.
+#>
+function Restore-Shell([string]$Shell, [string]$Dir, $Manifest) {
+    Initialize-Native
+    $orig = Read-RegColors (Join-Path $Dir $Manifest.registry)
+    $origDef = @{}; if ($orig.ContainsKey('console')) { $origDef = $orig['console'].Values }
+    $curDef = Get-ConsoleValues 'Console'
+    $same = $true
+    foreach ($n in $script:ConsoleColorValues) {
+        $a = $null; if ($origDef.ContainsKey($n)) { $a = [int]$origDef[$n] }
+        $b = $null; if ($curDef.ContainsKey($n) -and $curDef[$n] -is [int]) { $b = [int]$curDef[$n] }
+        if ($a -ne $b) { $same = $false; break }
+    }
+
+    $subs = @(Get-ShellKeyPaths $Shell)
+    foreach ($k in $orig.Keys) {
+        if (-not $k.StartsWith('console\')) { continue }
+        $nm = $orig[$k].Name
+        if ((Get-ShellOfExe ($nm -replace '^.*_', '')) -eq $Shell) { $subs += $nm }
+    }
+    $keysDone = 0
+    foreach ($sub in ($subs | Sort-Object -Unique)) {
+        $want = @{}
+        if (-not $same) { foreach ($n in $origDef.Keys) { $want[$n] = $origDef[$n] } }
+        $wasThere = $orig.ContainsKey($sub.ToLowerInvariant())
+        if ($wasThere) { $o = $orig[$sub.ToLowerInvariant()].Values; foreach ($n in $o.Keys) { $want[$n] = $o[$n] } }
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sub, $true)
+        if (-not $key -and -not $want.Count) { continue }
+        if (-not $key) { $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($sub) }
+        $empty = $false
+        try {
+            foreach ($n in $script:ConsoleColorValues) { $key.DeleteValue($n, $false) }
+            foreach ($n in $want.Keys) { $key.SetValue($n, [int]$want[$n], [Microsoft.Win32.RegistryValueKind]::DWord) }
+            $empty = ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0)
+        } finally { $key.Close() }
+        # Keys styley created for this shell and that are empty again are removed.
+        if ($empty -and -not $wasThere) { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($sub, $false) }
+        $keysDone++
+    }
+
+    $n = 0
+    $ws = New-Object -ComObject WScript.Shell
+    try {
+        foreach ($s in @($Manifest.shortcuts)) {
+            if (-not $s) { continue }
+            $copy = Join-Path $Dir "lnk\$($s.copy)"
+            if (-not (Test-Path -LiteralPath $copy)) { continue }
+            $sh = [string](Get-Prop $s 'shell')
+            if (-not $sh) { try { $sh = Get-ShellOfExe $ws.CreateShortcut($copy).TargetPath } catch { } }
+            if ($sh -ne $Shell) { continue }
+            try {
+                $changed = (-not (Test-Path -LiteralPath $s.original)) -or
+                    ((Get-FileHash -LiteralPath $copy).Hash -ne (Get-FileHash -LiteralPath $s.original).Hash)
+                if ($changed) { Copy-Item -LiteralPath $copy -Destination $s.original -Force }
+                if (-not $same -and -not [Styley.Shortcut]::GetPalette($s.original)) {
+                    $pal = Get-PaletteFromValues $origDef $curDef
+                    [void][Styley.Shortcut]::SetConsoleBlock($s.original, (New-ConsoleBlock $pal $null))
+                    $changed = $true
+                }
+                if ($changed) { $n++ }
+            } catch { Write-Warning "Shortcut not restored: $($s.original): $($_.Exception.Message)" }
+        }
+    } finally { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) }
+
+    $map = Get-ShellThemes
+    [void]$map.Remove($Shell)
+    Save-ShellThemes $map
+    Out "Restored $(Get-ShellLabel $Shell) from the backup of $($Manifest.created): $keysDone key(s), $n shortcut(s)."
+    Out (Dim "Open a new $(Get-ShellLabel $Shell) window to see the original colours.")
+}
+
+function Invoke-Restore([string[]]$Flags = @()) {
     $dir = Get-BackupDir
     $mf = Join-Path $dir 'manifest.json'
     if (-not (Test-Path -LiteralPath $mf)) { throw (New-StyleyError 'No backup found: styley has not changed anything yet.') }
     $m = [IO.File]::ReadAllText($mf) | ConvertFrom-Json
+    $shell = Get-TargetShell $Flags
+    if ($shell) { Restore-Shell $shell $dir $m; return }
+
     # `reg import` only adds values. Values styley added (e.g. ColorTable in per-shell keys that had none)
     # must be removed first, otherwise they keep overriding the restored defaults.
-    $keys = @('HKCU:\Console') + @(Get-ChildItem -LiteralPath 'HKCU:\Console' -ErrorAction SilentlyContinue | ForEach-Object { $_.PSPath })
-    foreach ($k in $keys) {
-        foreach ($v in $script:ConsoleColorValues) { Remove-ItemProperty -LiteralPath $k -Name $v -ErrorAction SilentlyContinue }
+    $orig = Read-RegColors (Join-Path $dir $m.registry)
+    $subs = @('Console') + @(Get-ConsoleSubKeyNames | ForEach-Object { "Console\$_" })
+    foreach ($sub in $subs) {
+        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($sub, $true)
+        if (-not $key) { continue }
+        $empty = $false
+        try {
+            foreach ($v in $script:ConsoleColorValues) { $key.DeleteValue($v, $false) }
+            $empty = ($key.ValueCount -eq 0 -and $key.SubKeyCount -eq 0)
+        } finally { $key.Close() }
+        # Shell keys styley created (not in the backup) and now empty are removed.
+        if ($empty -and $sub -ne 'Console' -and -not $orig.ContainsKey($sub.ToLowerInvariant())) {
+            [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey($sub, $false)
+        }
     }
     $regFile = Join-Path $dir $m.registry
     Invoke-Reg "import ""$regFile"""
@@ -801,8 +1109,7 @@ function Invoke-Restore {
         try { Copy-Item -LiteralPath $copy -Destination $s.original -Force; $n++ }
         catch { Write-Warning "Shortcut not restored: $($s.original): $($_.Exception.Message)" }
     }
-    $state = Join-Path $script:DataDir 'state.json'
-    Remove-Item -LiteralPath $state -Force -ErrorAction SilentlyContinue
+    Save-ShellThemes @{}
     Out "Restored console settings from $($m.created): registry + $n shortcut(s)."
     Out (Dim 'Open a new window to see the original colours.')
 }
@@ -826,12 +1133,18 @@ function Invoke-Pick([string]$Filter, [string[]]$Flags, [scriptblock]$ReadKey = 
     $mode = Get-ModeFromFlags $Flags
     $modes = @('all', 'dark', 'light')
     $original = Get-LivePalette
-    $state = Get-State
+    $shell = Get-TargetShell $Flags
+    $windowShell = Get-WindowShell
+    $map = Get-ShellThemes
+    $startName = $null
+    foreach ($k in @($shell, $windowShell) + @($script:Shells.Keys)) {
+        if ($k -and $map.ContainsKey($k)) { $startName = [string]$map[$k].theme; break }
+    }
     $filter = [string]$Filter
     $themes = Select-Themes $filter $mode
     $sel = 0
-    if ($state -and $state.theme) {
-        for ($i = 0; $i -lt $themes.Count; $i++) { if ($themes[$i].Name -eq $state.theme) { $sel = $i; break } }
+    if ($startName) {
+        for ($i = 0; $i -lt $themes.Count; $i++) { if ($themes[$i].Name -eq $startName) { $sel = $i; break } }
     }
     $top = 0; $applied = $null; $result = $null
     $E = $script:E
@@ -877,7 +1190,7 @@ function Invoke-Pick([string]$Filter, [string[]]$Flags, [scriptblock]$ReadKey = 
             $sb = New-Object Text.StringBuilder
             [void]$sb.Append("$E[H")
             $modeTxt = ($modes | ForEach-Object { if ($_ -eq $mode) { "[$_]" } else { " $_ " } }) -join ''
-            [void]$sb.Append("$E[1m styley pick$E[0m  $($themes.Count) themes  $E[2mTab:$E[0m$modeTxt$E[K`n")
+            [void]$sb.Append("$E[1m styley pick$E[0m -> $(Get-ShellLabel $shell)  $($themes.Count) themes  $E[2mTab:$E[0m$modeTxt$E[K`n")
             [void]$sb.Append(" filter: $E[4m$filter$E[0m_$E[K`n$E[K`n")
             for ($r = 0; $r -lt $rows; $r++) {
                 $idx = $top + $r
@@ -925,7 +1238,13 @@ function Invoke-Pick([string]$Filter, [string[]]$Flags, [scriptblock]$ReadKey = 
             try { Set-LivePalette $original } catch { }
         }
     }
-    if ($result -eq 'apply') { Invoke-Set -Query $cur.Name -Flags $Flags -Theme $cur }
+    if ($result -eq 'apply') {
+        Invoke-Set -Query $cur.Name -Flags $Flags -Theme $cur
+        # Theme for the other shell: this window goes back to its own colours.
+        if ($shell -and $windowShell -and $windowShell -ne $shell -and -not (Test-Flag $Flags '--session', '-s')) {
+            try { Set-LivePalette $original } catch { }
+        }
+    }
     else { Out 'Cancelled, nothing changed.' }
 }
 
@@ -942,21 +1261,28 @@ function Show-Help {
     Out "    $(& $c 'pick') [filter]          Browse themes interactively; the window recolours as you move"
     Out "    $(& $c 'list') [filter]          List themes with their palettes"
     Out "    $(& $c 'show') <theme>           Preview a theme: mock session + 16-colour palette"
-    Out "    $(& $c 'set') <theme>            Apply a theme to this window, new windows and shortcuts"
+    Out "    $(& $c 'set') <theme>            Apply a theme to this window, new windows and shortcuts (both shells or --only one)"
     Out "    $(& $c 'random') [filter]        Apply a random theme"
-    Out "    $(& $c 'current')                Show the theme set by styley and this window's palette"
+    Out "    $(& $c 'current')                Show the theme of each shell and this window's palette"
     Out "    $(& $c 'reset')                  Apply the Windows default palette (Campbell)"
     Out "    $(& $c 'restore')                Undo: bring back the console settings saved before the first change"
+    Out "                           (restore --only cmd / --only powershell: undo one shell only)"
     Out "    $(& $c 'import') <path>          Add themes: iTerm2-Color-Schemes folder, *.json (Windows Terminal), *.itermcolors"
     Out "    $(& $c 'update')                 Download all themes from github.com/mbadolato/iTerm2-Color-Schemes"
     Out "    $(& $c 'export') <theme>         Print a theme: --format wt (Windows Terminal JSON) | reg"
     Out "    $(& $c 'help') | $(& $c 'version')"
     Out ''
     Out "  $(& $h 'OPTIONS')"
+    Out "    --only <shell>         One shell only: powershell or cmd (set, pick, random, reset, restore)"
+    Out "    --powershell, --cmd    Same as --only powershell / --only cmd"
     Out "    --dark, --light        Only dark / light themes (list, pick, random)"
     Out "    --session, -s          Change only the current window (set, random)"
     Out "    --no-shortcuts         Do not touch .lnk shortcuts (set, random, pick)"
     Out "    --keep-ansi            Keep the theme's ANSI black/white instead of using its background/foreground"
+    Out ''
+    Out "  $(& $h 'SHELLS')"
+    Out "    Without --only, PowerShell and CMD share one theme. With --only each shell keeps its own;"
+    Out "    a later set without --only makes them share one theme again."
     Out ''
     Out "  $(& $h 'THEME NAMES')"
     Out "    Full name in quotes, its slug, or a unique part of the slug:"
@@ -968,10 +1294,13 @@ function Show-Help {
     Out "    styley show catppuccin-mocha       $(Dim '# preview before applying')"
     Out "    styley set ""Atom One Dark""         $(Dim '# apply everywhere')"
     Out "    styley set nord -s                 $(Dim '# try in this window only')"
+    Out "    styley set nord --only cmd         $(Dim '# CMD gets Nord, PowerShell keeps its theme')"
+    Out "    styley pick --powershell           $(Dim '# choose a theme for PowerShell only')"
     Out "    styley random --light              $(Dim '# feeling lucky')"
     Out "    styley export nord --format wt     $(Dim '# for Windows Terminal settings.json')"
     Out "    styley update                      $(Dim '# all 880+ schemes, incl. ones not bundled (e.g. Dracula)')"
     Out "    styley import C:\src\iTerm2-Color-Schemes"
+    Out "    styley restore --only cmd          $(Dim '# undo CMD only')"
     Out "    styley restore                     $(Dim '# undo all changes')"
     Out ''
 
@@ -1001,15 +1330,14 @@ function Invoke-Styley([string[]]$Arguments) {
     $Arguments = @($Arguments | Where-Object { $_ -ne $null })
     $cmd = 'help'; if ($Arguments.Count) { $cmd = $Arguments[0].ToLowerInvariant() }
     $rest = @(); if ($Arguments.Count -gt 1) { $rest = @($Arguments[1..($Arguments.Count - 1)]) }
-    $flags = @($rest | Where-Object { $_ -like '-*' })
-    $positional = @($rest | Where-Object { $_ -notlike '-*' })
-    # --format <value> / --url <value> take a value: drop it from positionals.
-    foreach ($opt in '--format', '--url') {
-        $v = Get-FlagValue $flags $opt
-        if (-not $v) {
-            for ($i = 0; $i -lt $rest.Count - 1; $i++) { if ($rest[$i] -ieq $opt) { $v = $rest[$i + 1]; $flags += $v } }
-            if ($v) { $positional = @($positional | Where-Object { $_ -ne $v }) }
-        }
+    # Options that take a value keep it right after them in $flags (see Get-FlagValue).
+    $valueOptions = @('--format', '--url', '--only')
+    $flags = @(); $positional = @()
+    for ($i = 0; $i -lt $rest.Count; $i++) {
+        $a = $rest[$i]
+        if ($valueOptions -contains $a.ToLowerInvariant() -and $i + 1 -lt $rest.Count) { $flags += $a, $rest[$i + 1]; $i++ }
+        elseif ($a -like '-*') { $flags += $a }
+        else { $positional += $a }
     }
     $arg = ($positional -join ' ').Trim()
 
@@ -1025,7 +1353,7 @@ function Invoke-Styley([string[]]$Arguments) {
             '^random$' { Invoke-Random $arg $flags; break }
             '^current$' { Invoke-Current; break }
             '^reset$' { Invoke-Set 'Campbell' $flags; break }
-            '^restore$' { Invoke-Restore; break }
+            '^restore$' { Invoke-Restore $flags; break }
             '^import$' { Invoke-Import $arg -Replace:(Test-Flag $flags '--replace'); break }
             '^update$' { Invoke-Update $flags; break }
             '^export$' { Invoke-Export $arg $flags; break }

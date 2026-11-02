@@ -9,7 +9,8 @@ It uses the schemes from [iTerm2-Color-Schemes](https://github.com/mbadolato/iTe
 ```
 styley pick --dark          # browse dark themes; the window recolours as you move; Enter applies
 styley show nord            # preview: a mock session in the theme's colours + its 16-colour palette
-styley set "Gruvbox Dark"   # apply to this window, new windows and shortcuts
+styley set "Gruvbox Dark"   # apply to PowerShell and CMD: this window, new windows, shortcuts
+styley set nord --only cmd  # a separate theme for CMD; PowerShell keeps its own
 styley restore              # undo everything
 ```
 
@@ -39,15 +40,17 @@ uninstall.cmd
 
 The uninstaller does three things, in this order:
 
-1. **Restores the original console colours**, the same way as `styley restore`: it brings back the registry values and the
-   shortcuts saved before styley's first change. If styley never changed anything, it skips this step.
+1. **Restores the original console colours of both shells**, the same way as `styley restore`: it brings back the
+   registry values and the shortcuts saved before styley's first change. This works whether PowerShell and CMD shared one
+   theme or had separate ones. If styley never changed anything, it skips this step.
 2. Removes styley from the user `PATH` and deletes `%LOCALAPPDATA%\Programs\styley`. It removes both the normal and the `-Dev` install.
 3. Keeps your user data in `%LOCALAPPDATA%\styley`: imported themes and the backup.
 
 | Option | Effect |
 |---|---|
-| `-KeepColors` | Leave the current theme in place; only remove the program |
-| `-Purge` | Also delete `%LOCALAPPDATA%\styley`. It is kept if combined with `-KeepColors`, because it holds the only backup of your original colours |
+| `-KeepColors` | Keep the themes of both shells; only remove the program |
+| `-KeepColorsFor powershell` / `-KeepColorsFor cmd` | Keep the theme of that shell; restore the other one |
+| `-Purge` | Also delete `%LOCALAPPDATA%\styley`. It is kept if combined with `-KeepColors` or `-KeepColorsFor`, because it holds the only backup of your original colours |
 
 `uninstall.cmd` is the same as `install.cmd -Uninstall`. Open a new window afterwards to see the original colours.
 
@@ -58,22 +61,41 @@ The uninstaller does three things, in this order:
 | `styley pick [filter]` | Interactive browser. Up/Down, PgUp/PgDn, Home/End to move, type to filter, Tab cycles all/dark/light, Enter applies, Esc cancels and restores the old colours |
 | `styley list [filter]` | List themes with palette swatches |
 | `styley show <theme>` | Preview a theme |
-| `styley set <theme>` | Apply a theme |
+| `styley set <theme>` | Apply a theme to both shells, or to one with `--only` |
 | `styley random [filter]` | Apply a random theme |
-| `styley current` | Theme set by styley + the palette of this window |
+| `styley current` | Theme of each shell (PowerShell, CMD) + the palette of this window |
 | `styley reset` | Windows default palette (Campbell) |
-| `styley restore` | Bring back the console settings saved before styley first changed anything |
+| `styley restore` | Bring back the console settings saved before styley first changed anything (`--only <shell>`: one shell) |
 | `styley import <path>` | Add themes from an iTerm2-Color-Schemes folder, Windows Terminal `*.json` files (single schemes or `settings.json`), or `*.itermcolors` files |
 | `styley update` | Download all schemes from GitHub |
 | `styley export <theme> --format wt\|reg` | Print the theme as a Windows Terminal scheme or as a `.reg` file |
 
-Options: `--dark` / `--light` (list, pick, random), `--session` / `-s` (change only the current window),
-`--no-shortcuts`, `--keep-ansi` (see below).
+Options: `--only powershell` / `--only cmd`, also written as `--powershell` / `--cmd` (set, pick, random, reset, restore), `--dark` / `--light`
+(list, pick, random), `--session` / `-s` (change only the current window), `--no-shortcuts`, `--keep-ansi` (see below).
 
 You can give a theme by its full name in quotes (`"Gruvbox Dark Hard"`), by its slug (`gruvbox-dark-hard`) or by a unique
 part of the slug (`gruvbox-dark-h`). Use the slug form in CMD for names with `&` (for example `moss-ember`).
 
 Your own themes: put Windows Terminal scheme `*.json` files or `*.itermcolors` files into `%LOCALAPPDATA%\styley\custom\`.
+
+## One theme or separate themes for PowerShell and CMD
+
+Without `--only`, PowerShell and CMD **share one theme**. With `--only`, each shell keeps its own:
+
+```
+styley set gruvbox-dark --only powershell
+styley set nord --only cmd
+styley current
+  PowerShell : Gruvbox Dark
+  CMD        : Nord
+styley restore --only cmd      # CMD back to its original colours; PowerShell keeps Gruvbox Dark
+styley set tokyonight          # without --only: both shells share one theme again
+```
+
+* `styley pick --only cmd` previews themes in the current window and applies the chosen one to CMD only. If you run it
+  from a PowerShell window, that window gets its own colours back afterwards.
+* `set --only` changes the current window only if it belongs to that shell. Otherwise it tells you to open a new window.
+* `styley list` marks the themes in use: `*` both shells, `P` PowerShell, `C` CMD.
 
 ## How it works
 
@@ -84,13 +106,26 @@ A classic console window takes its colours from three places, in increasing prio
 3. **the `.lnk` shortcut** the window was started from. The stock *Windows PowerShell* shortcut has its own copy of
    the palette (the classic blue one), and this copy overrides the registry.
 
-This is why changing only the registry often "does nothing". `styley set` writes all three places:
+This is why changing only the registry often "does nothing". `styley set` without `--only` writes all three places:
 
 * **this window**: it changes immediately through `SetConsoleScreenBufferInfoEx`. Text already on screen that uses the default colour is recoloured too.
 * **registry**: `HKCU\Console` and the existing per-program keys of `powershell.exe`, `pwsh.exe` and `cmd.exe`.
 * **shortcuts**: it updates the console palette stored in each `.lnk` that starts `powershell.exe`, `pwsh.exe` or `cmd.exe`
   (Start menu, taskbar, desktop), using `IShellLinkDataList`. Shortcuts under `ProgramData` need admin rights and are
   skipped otherwise. Run styley from an elevated window to include them.
+
+With `--only <shell>`, styley does not touch the shared `HKCU\Console`:
+
+* **registry**: it writes only that shell's keys and creates them if they are missing. These are
+  `%SystemRoot%_System32_WindowsPowerShell_v1.0_powershell.exe` and its `SysWOW64` twin, plus the `pwsh.exe` key if PowerShell 7 is
+  installed, or `%SystemRoot%_system32_cmd.exe` and its `SysWOW64` twin.
+* **shortcuts**: it updates only shortcuts to that shell. A shortcut without its own palette, such as the stock *Command Prompt*,
+  ignores the per-program key and reads the shared `HKCU\Console`. So styley gives such a shortcut its own console block, with window
+  and font settings copied from the registry and colours from the theme. Otherwise CMD started from the Start menu would not change.
+
+`styley restore --only <shell>` puts that shell's keys and shortcuts back. If the shared defaults are no longer the
+original ones, because a theme was later set for both shells, it copies the original defaults into the shell's own keys and
+shortcuts, so the shell looks as it did before and the other shell keeps its theme.
 
 Before the first change, styley saves `HKCU\Console` and every shortcut it may touch to
 `%LOCALAPPDATA%\styley\backup\original`. `styley restore` first removes the colour values styley wrote and then

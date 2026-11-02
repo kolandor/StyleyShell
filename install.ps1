@@ -9,7 +9,9 @@
   -Dev puts this repository's bin folder on PATH instead of copying (edits take effect at once).
   -Uninstall (or uninstall.cmd) first restores the console colours saved before styley's first change
   (registry + shortcuts, same as `styley restore`), then removes the PATH entry and the installed copy.
-  -KeepColors leaves the current theme in place. User data in %LOCALAPPDATA%\styley (imported themes,
+  Both shells are restored, PowerShell and CMD, whether their themes were shared or set separately
+  with --only. -KeepColors leaves both themes in place; -KeepColorsFor powershell|cmd keeps the theme
+  of that shell and restores the other one. User data in %LOCALAPPDATA%\styley (imported themes,
   backup) is kept unless -Purge is given.
 
 .EXAMPLE
@@ -18,12 +20,15 @@
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Dev
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall -Purge
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\install.ps1 -Uninstall -KeepColorsFor cmd
 #>
 param(
     [switch]$Dev,
     [switch]$Uninstall,
     [switch]$Purge,
     [switch]$KeepColors,
+    [ValidateSet('powershell', 'cmd')][string]$KeepColorsFor,
     [string]$Destination = (Join-Path $env:LOCALAPPDATA 'Programs\styley')
 )
 
@@ -76,11 +81,16 @@ if ($Uninstall) {
     $dataDir = Join-Path $env:LOCALAPPDATA 'styley'
     $hasBackup = Test-Path -LiteralPath (Join-Path $dataDir 'backup\original\manifest.json')
 
-    # 1. Original console colours back (registry + shortcuts), unless asked to keep the theme.
-    if ($hasBackup -and -not $KeepColors) {
+    # 1. Original console colours back (registry + shortcuts) for both shells, or for the one not kept.
+    $kept = @()
+    if ($KeepColors) { $kept = @('powershell', 'cmd') } elseif ($KeepColorsFor) { $kept = @($KeepColorsFor) }
+    if ($hasBackup -and $kept.Count -lt 2) {
         $tool = Join-Path $Destination 'src\styley.ps1'
         if (-not (Test-Path -LiteralPath $tool)) { $tool = Join-Path $repo 'src\styley.ps1' }
-        & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool restore
+        $restoreArgs = @('restore')
+        if ($kept -contains 'powershell') { $restoreArgs += '--only', 'cmd' }
+        elseif ($kept -contains 'cmd') { $restoreArgs += '--only', 'powershell' }
+        & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $tool @restoreArgs
         if ($LASTEXITCODE -ne 0) { throw "styley restore failed ($LASTEXITCODE); nothing was removed. Use -KeepColors to uninstall anyway." }
     }
 
@@ -90,14 +100,17 @@ if ($Uninstall) {
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
 
     # 3. User data (imported themes, backup, cache, state).
-    if ($Purge -and $hasBackup -and $KeepColors) {
-        Write-Warning "Keeping $dataDir : -KeepColors with -Purge would delete the only backup of your original colours."
+    if ($Purge -and $hasBackup -and $kept.Count) {
+        Write-Warning "Keeping $dataDir : with -KeepColors/-KeepColorsFor, -Purge would delete the only backup of your original colours."
     } elseif ($Purge) {
         Remove-Item -LiteralPath $dataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 
     Write-Host 'styley removed from PATH and disk.'
-    if ($hasBackup -and $KeepColors) { Write-Host 'Console colours left as they are (-KeepColors).' }
+    if ($hasBackup -and $kept.Count) {
+        $names = ($kept | ForEach-Object { if ($_ -eq 'cmd') { 'CMD' } else { 'PowerShell' } }) -join ' and '
+        Write-Host "Theme kept for: $names."
+    }
     if (Test-Path -LiteralPath $dataDir) { Write-Host "User data kept in $dataDir (delete it or run uninstall with -Purge)." }
     return
 }
@@ -123,3 +136,9 @@ if (($env:Path -split ';') -notcontains $bin) { $env:Path = "$env:Path;$bin" }  
 Write-Host "styley installed: $bin"
 if ($added) { Write-Host 'Added to the user PATH. Open a new PowerShell or CMD window, then run:  styley help' }
 else { Write-Host 'Already on the user PATH. Run:  styley help' }
+Write-Host ''
+Write-Host 'Quick start:'
+Write-Host '  styley pick                    choose one theme for PowerShell and CMD'
+Write-Host '  styley pick --only cmd         choose a theme for CMD only (also: --only powershell)'
+Write-Host '  styley current                 theme of each shell'
+Write-Host '  styley restore                 original colours (restore --only cmd: one shell)'

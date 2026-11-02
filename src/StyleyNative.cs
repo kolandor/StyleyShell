@@ -132,6 +132,20 @@ namespace Styley
             }
         }
 
+        [DllImport("kernel32.dll", SetLastError = true)] static extern uint GetConsoleProcessList([Out] uint[] list, uint count);
+
+        /// <summary>Process ids attached to this console window (empty when unknown).</summary>
+        public static uint[] GetProcesses()
+        {
+            var buf = new uint[64];
+            uint n = GetConsoleProcessList(buf, (uint)buf.Length);
+            if (n == 0) return new uint[0];
+            if (n > buf.Length) { buf = new uint[n]; n = GetConsoleProcessList(buf, n); }
+            var r = new uint[Math.Min(n, (uint)buf.Length)];
+            Array.Copy(buf, r, r.Length);
+            return r;
+        }
+
         /// <summary>Enables VT escape processing on the console output. Returns the previous mode, or -1.</summary>
         public static long EnableVirtualTerminal()
         {
@@ -204,6 +218,33 @@ namespace Styley
                 finally { LocalFree(p); }
                 ((IPersistFile)link).Save(null, true);
                 return "updated";
+            }
+            finally { Marshal.ReleaseComObject(link); }
+        }
+
+        /// <summary>
+        /// Adds (or replaces) the whole console block of a .lnk. Used for shortcuts that have no block:
+        /// such shortcuts take colours from HKCU\Console, not from the per-program key, so a theme for one
+        /// shell only would not reach them otherwise.
+        /// </summary>
+        public static string SetConsoleBlock(string path, byte[] block)
+        {
+            if (block == null || block.Length != NT_CONSOLE_PROPS_SIZE) throw new ArgumentException("block must be 204 bytes");
+            object link = Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ShellLink));
+            try
+            {
+                ((IPersistFile)link).Load(path, 2 /* STGM_READWRITE */);
+                var dl = (IShellLinkDataList)link;
+                try { dl.RemoveDataBlock(NT_CONSOLE_PROPS_SIG); } catch (COMException) { }
+                IntPtr p = Marshal.AllocHGlobal(block.Length);
+                try
+                {
+                    Marshal.Copy(block, 0, p, block.Length);
+                    dl.AddDataBlock(p);
+                }
+                finally { Marshal.FreeHGlobal(p); }
+                ((IPersistFile)link).Save(null, true);
+                return "created";
             }
             finally { Marshal.ReleaseComObject(link); }
         }
